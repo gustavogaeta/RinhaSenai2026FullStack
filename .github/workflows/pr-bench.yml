@@ -1,0 +1,259 @@
+name: PR Bench
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    needs: []
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Detect team folder
+        id: team
+        run: |
+          FOLDERS=$(git diff --name-only origin/main...HEAD | grep '^participants/' | cut -d'/' -f2 | sort -u)
+          TEAM=$(echo "$FOLDERS" | head -1)
+          echo "team=$TEAM" >> "$GITHUB_OUTPUT"
+          echo "dir=participants/$TEAM" >> "$GITHUB_OUTPUT"
+
+      - name: Install, build and start
+        working-directory: ${{ steps.team.outputs.dir }}
+        run: |
+          rm -f data.db
+          npm install
+          npm run build
+          npm start &
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run smoke tests
+        id: smoke
+        run: |
+          RESULTS=""
+          PASS=0
+          FAIL=0
+
+          # Test: health endpoint
+          if curl -sf http://localhost:3000/api/health | grep -q '"ok"'; then
+            RESULTS="$RESULTS\n- [x] Health check"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Health check"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: create transaction (visa, 1x)
+          RESP=$(curl -s -w "\n%{http_code}" -X POST http://localhost:3000/api/transactions \
+            -H "Content-Type: application/json" \
+            -d '{"card_number":"4111111111111111","holder_name":"Bench Test","expiration":"12/28","cvv":"123","amount_cents":10000,"installments":1,"description":"Bench test","idempotency_key":"bench-001"}')
+          CODE=$(echo "$RESP" | tail -1)
+          BODY=$(echo "$RESP" | head -n -1)
+          if [ "$CODE" = "201" ]; then
+            RESULTS="$RESULTS\n- [x] POST /api/transactions retorna 201"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] POST /api/transactions retorna 201 (recebeu $CODE)"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: approved status
+          if echo "$BODY" | grep -q '"status":"approved"'; then
+            RESULTS="$RESULTS\n- [x] Status approved para cartao valido"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Status approved para cartao valido"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: visa brand detected
+          if echo "$BODY" | grep -q '"card_brand":"visa"'; then
+            RESULTS="$RESULTS\n- [x] Bandeira visa detectada (cartao 4xxx)"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Bandeira visa detectada (cartao 4xxx)"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: fee calculation (visa 2.5% of 10000 = 250)
+          if echo "$BODY" | grep -q '"fee_cents":250'; then
+            RESULTS="$RESULTS\n- [x] Taxa visa 2.5% calculada corretamente"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Taxa visa 2.5% calculada corretamente"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: idempotency (same key returns 200)
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/api/transactions \
+            -H "Content-Type: application/json" \
+            -d '{"card_number":"4111111111111111","holder_name":"Bench Test","expiration":"12/28","cvv":"123","amount_cents":10000,"installments":1,"description":"Bench test","idempotency_key":"bench-001"}')
+          if [ "$CODE" = "200" ]; then
+            RESULTS="$RESULTS\n- [x] Idempotencia: mesma key retorna 200"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Idempotencia: mesma key retorna 200 (recebeu $CODE)"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: mastercard (5xxx)
+          RESP=$(curl -s -X POST http://localhost:3000/api/transactions \
+            -H "Content-Type: application/json" \
+            -d '{"card_number":"5111111111111111","holder_name":"MC Test","expiration":"12/28","cvv":"123","amount_cents":20000,"installments":1,"description":"MC","idempotency_key":"bench-002"}')
+          if echo "$RESP" | grep -q '"card_brand":"mastercard"'; then
+            RESULTS="$RESULTS\n- [x] Bandeira mastercard detectada (cartao 5xxx)"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Bandeira mastercard detectada (cartao 5xxx)"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: declined card (9999)
+          RESP=$(curl -s -X POST http://localhost:3000/api/transactions \
+            -H "Content-Type: application/json" \
+            -d '{"card_number":"9999111111111111","holder_name":"Declined","expiration":"12/28","cvv":"123","amount_cents":10000,"installments":1,"description":"Declined","idempotency_key":"bench-003"}')
+          if echo "$RESP" | grep -q '"status":"declined"'; then
+            RESULTS="$RESULTS\n- [x] Cartao 9999 retorna declined"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Cartao 9999 retorna declined"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: unsupported brand (1xxx) = 422
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/api/transactions \
+            -H "Content-Type: application/json" \
+            -d '{"card_number":"1111111111111111","holder_name":"Bad","expiration":"12/28","cvv":"123","amount_cents":10000,"installments":1,"description":"Bad","idempotency_key":"bench-004"}')
+          if [ "$CODE" = "422" ]; then
+            RESULTS="$RESULTS\n- [x] Bandeira invalida rejeitada 422"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Bandeira invalida rejeitada 422 (recebeu $CODE)"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: installments with interest (3x, 2% compound)
+          RESP=$(curl -s -X POST http://localhost:3000/api/transactions \
+            -H "Content-Type: application/json" \
+            -d '{"card_number":"4111111111111111","holder_name":"Install","expiration":"12/28","cvv":"123","amount_cents":50000,"installments":3,"description":"Parcelas","idempotency_key":"bench-005"}')
+          # 50000 * 1.02^3 = 53060.804 -> ceil = 53061
+          if echo "$RESP" | grep -q '"total_with_interest":53061'; then
+            RESULTS="$RESULTS\n- [x] Juros compostos 2%/mes calculados corretamente (3x)"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Juros compostos 2%/mes calculados corretamente (3x)"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: refund
+          TX_ID=$(curl -s http://localhost:3000/api/transactions?limit=100 | node -e "
+            let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+              const j=JSON.parse(d);
+              const t=j.data.find(x=>x.status==='approved');
+              if(t)console.log(t.id);
+            })")
+          if [ -n "$TX_ID" ]; then
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:3000/api/transactions/$TX_ID/refund")
+            if [ "$CODE" = "200" ]; then
+              RESULTS="$RESULTS\n- [x] Estorno funciona (approved -> refunded)"
+              PASS=$((PASS+1))
+              # Double refund
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:3000/api/transactions/$TX_ID/refund")
+              if [ "$CODE" = "422" ]; then
+                RESULTS="$RESULTS\n- [x] Double refund rejeitado 422"
+                PASS=$((PASS+1))
+              else
+                RESULTS="$RESULTS\n- [ ] Double refund rejeitado 422 (recebeu $CODE)"
+                FAIL=$((FAIL+1))
+              fi
+            else
+              RESULTS="$RESULTS\n- [ ] Estorno funciona (recebeu $CODE)"
+              FAIL=$((FAIL+1))
+            fi
+          fi
+
+          # Test: balance
+          BALANCE=$(curl -s http://localhost:3000/api/balance)
+          if echo "$BALANCE" | grep -q '"balance_cents"'; then
+            RESULTS="$RESULTS\n- [x] Balance endpoint funciona"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Balance endpoint funciona"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: pagination
+          LIST=$(curl -s "http://localhost:3000/api/transactions?page=1&limit=2")
+          if echo "$LIST" | grep -q '"total_pages"'; then
+            RESULTS="$RESULTS\n- [x] Paginacao funciona"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Paginacao funciona"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: frontend served
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/)
+          if [ "$CODE" = "200" ]; then
+            RESULTS="$RESULTS\n- [x] Frontend servido na porta 3000"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Frontend servido na porta 3000 (HTTP $CODE)"
+            FAIL=$((FAIL+1))
+          fi
+
+          TOTAL=$((PASS+FAIL))
+          echo "results<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$RESULTS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "pass=$PASS" >> "$GITHUB_OUTPUT"
+          echo "fail=$FAIL" >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+      - name: Post results as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const team = '${{ steps.team.outputs.team }}';
+            const pass = ${{ steps.smoke.outputs.pass }};
+            const fail = ${{ steps.smoke.outputs.fail }};
+            const total = ${{ steps.smoke.outputs.total }};
+            const results = `${{ steps.smoke.outputs.results }}`;
+
+            const body = `## Resultado -- ${team}
+
+            | Metrica | Valor |
+            |---------|-------|
+            | Testes passando | ${pass}/${total} |
+            | Testes falhando | ${fail}/${total} |
+
+            ### Detalhes
+            ${results}
+
+            ---
+            > Bench automatico executado pelo CI
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body,
+            });

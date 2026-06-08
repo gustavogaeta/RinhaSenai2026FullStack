@@ -1,0 +1,150 @@
+name: PR Validate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Detect team folder
+        id: team
+        run: |
+          FOLDERS=$(git diff --name-only origin/main...HEAD | grep '^participants/' | cut -d'/' -f2 | sort -u)
+          COUNT=$(echo "$FOLDERS" | grep -c .)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::PR deve alterar exatamente uma pasta em participants/. Encontradas: $FOLDERS"
+            exit 1
+          fi
+          TEAM=$(echo "$FOLDERS" | head -1)
+          echo "team=$TEAM" >> "$GITHUB_OUTPUT"
+          echo "dir=participants/$TEAM" >> "$GITHUB_OUTPUT"
+          echo "Team detectado: $TEAM"
+
+      - name: Check files outside participants/
+        run: |
+          OUTSIDE=$(git diff --name-only origin/main...HEAD | grep -v '^participants/' || true)
+          if [ -n "$OUTSIDE" ]; then
+            echo "::error::PR altera arquivos fora de participants/: $OUTSIDE"
+            exit 1
+          fi
+
+      - name: Validate info.json
+        run: |
+          TEAM="${{ steps.team.outputs.team }}"
+          DIR="${{ steps.team.outputs.dir }}"
+          if [ ! -f "$DIR/info.json" ]; then
+            echo "::error::info.json nao encontrado em $DIR/"
+            exit 1
+          fi
+          node -e "
+            const info = require('./$DIR/info.json');
+            if (info.team !== '$TEAM') {
+              console.error('team no info.json ('+info.team+') nao bate com a pasta ($TEAM)');
+              process.exit(1);
+            }
+            if (!Array.isArray(info.members) || info.members.length < 1) {
+              console.error('members deve ter pelo menos 1 membro');
+              process.exit(1);
+            }
+            for (const m of info.members) {
+              if (!m.name || !m.github || !m.github.startsWith('@')) {
+                console.error('Membro invalido: ' + JSON.stringify(m));
+                process.exit(1);
+              }
+            }
+            console.log('info.json valido: team=' + info.team + ', ' + info.members.length + ' membros');
+          "
+
+      - name: Validate package.json
+        run: |
+          DIR="${{ steps.team.outputs.dir }}"
+          if [ ! -f "$DIR/package.json" ]; then
+            echo "::error::package.json nao encontrado em $DIR/"
+            exit 1
+          fi
+          node -e "
+            const pkg = require('./$DIR/package.json');
+            if (!pkg.scripts?.build) { console.error('script build faltando'); process.exit(1); }
+            if (!pkg.scripts?.start) { console.error('script start faltando'); process.exit(1); }
+            console.log('package.json valido');
+          "
+
+      - name: Check file count and sizes
+        run: |
+          DIR="${{ steps.team.outputs.dir }}"
+          FILES=$(git diff --name-only origin/main...HEAD | wc -l)
+          if [ "$FILES" -gt 100 ]; then
+            echo "::error::PR tem $FILES arquivos (max 100)"
+            exit 1
+          fi
+          LARGE=$(git diff --name-only origin/main...HEAD | while read f; do
+            if [ -f "$f" ]; then
+              SIZE=$(wc -c < "$f")
+              if [ "$SIZE" -gt 5242880 ]; then echo "$f ($SIZE bytes)"; fi
+            fi
+          done)
+          if [ -n "$LARGE" ]; then
+            echo "::error::Arquivos maiores que 5MB: $LARGE"
+            exit 1
+          fi
+
+      - name: Check no node_modules or db files
+        run: |
+          BAD=$(git diff --name-only origin/main...HEAD | grep -E '(node_modules/|\.db$)' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::Arquivos proibidos no PR: $BAD"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        working-directory: ${{ steps.team.outputs.dir }}
+        run: npm install
+        timeout-minutes: 2
+
+      - name: Build frontend
+        working-directory: ${{ steps.team.outputs.dir }}
+        run: npm run build
+        timeout-minutes: 1
+
+      - name: Start server and health check
+        working-directory: ${{ steps.team.outputs.dir }}
+        run: |
+          npm start &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
+              echo "Server healthy after ${i}s"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "::error::Server nao respondeu em 30s"
+              kill $SERVER_PID 2>/dev/null
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # Check frontend is served
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Frontend nao servido (HTTP $STATUS)"
+            kill $SERVER_PID 2>/dev/null
+            exit 1
+          fi
+
+          echo "Validacao completa!"
+          kill $SERVER_PID 2>/dev/null

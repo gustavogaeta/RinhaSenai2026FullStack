@@ -1,0 +1,166 @@
+name: Main Rank
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'participants/**'
+
+permissions:
+  contents: write
+
+jobs:
+  rank:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Discover teams
+        id: teams
+        run: |
+          TEAMS=$(ls -d participants/*/  2>/dev/null | xargs -I{} basename {} | tr '\n' ' ')
+          echo "teams=$TEAMS" >> "$GITHUB_OUTPUT"
+          echo "Discovered teams: $TEAMS"
+
+      - name: Bench all teams
+        run: |
+          mkdir -p results
+          for TEAM_DIR in participants/*/; do
+            TEAM=$(basename "$TEAM_DIR")
+            echo "========================================="
+            echo "Benchmarking: $TEAM"
+            echo "========================================="
+
+            cd "$TEAM_DIR"
+            rm -f data.db data.db-journal data.db-wal
+
+            npm install 2>&1 || { echo "{\"team\":\"$TEAM\",\"error\":\"npm install failed\"}" > "../../results/$TEAM.json"; cd ../..; continue; }
+            npm run build 2>&1 || { echo "{\"team\":\"$TEAM\",\"error\":\"npm run build failed\"}" > "../../results/$TEAM.json"; cd ../..; continue; }
+            npm start &
+            SERVER_PID=$!
+            sleep 5
+
+            HEALTHY=false
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
+                HEALTHY=true
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$HEALTHY" = false ]; then
+              echo "{\"team\":\"$TEAM\",\"error\":\"server did not start\"}" > "../../results/$TEAM.json"
+              kill $SERVER_PID 2>/dev/null
+              cd ../..
+              continue
+            fi
+
+            PASS=0
+            FAIL=0
+
+            # Basic tests
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/api/transactions \
+              -H "Content-Type: application/json" \
+              -d "{\"card_number\":\"4111111111111111\",\"holder_name\":\"Rank\",\"expiration\":\"12/28\",\"cvv\":\"123\",\"amount_cents\":10000,\"installments\":1,\"description\":\"Rank\",\"idempotency_key\":\"rank-$TEAM-001\"}")
+            [ "$CODE" = "201" ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+            # Idempotency
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/api/transactions \
+              -H "Content-Type: application/json" \
+              -d "{\"card_number\":\"4111111111111111\",\"holder_name\":\"Rank\",\"expiration\":\"12/28\",\"cvv\":\"123\",\"amount_cents\":10000,\"installments\":1,\"description\":\"Rank\",\"idempotency_key\":\"rank-$TEAM-001\"}")
+            [ "$CODE" = "200" ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+            # Declined
+            RESP=$(curl -s -X POST http://localhost:3000/api/transactions \
+              -H "Content-Type: application/json" \
+              -d "{\"card_number\":\"9999111111111111\",\"holder_name\":\"Declined\",\"expiration\":\"12/28\",\"cvv\":\"123\",\"amount_cents\":10000,\"installments\":1,\"description\":\"Declined\",\"idempotency_key\":\"rank-$TEAM-002\"}")
+            echo "$RESP" | grep -q '"declined"' && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+            # Balance
+            curl -sf http://localhost:3000/api/balance > /dev/null && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+            # Frontend
+            curl -sf http://localhost:3000/ > /dev/null && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+            TOTAL=$((PASS+FAIL))
+
+            # Read info.json
+            INFO=$(cat info.json 2>/dev/null || echo '{}')
+
+            echo "{\"team\":\"$TEAM\",\"pass\":$PASS,\"fail\":$FAIL,\"total\":$TOTAL,\"info\":$INFO}" > "../../results/$TEAM.json"
+
+            kill $SERVER_PID 2>/dev/null
+            wait $SERVER_PID 2>/dev/null
+            cd ../..
+          done
+
+      - name: Generate LEADERBOARD.md
+        run: |
+          node -e "
+            const fs = require('fs');
+            const files = fs.readdirSync('results').filter(f => f.endsWith('.json'));
+            const teams = files.map(f => JSON.parse(fs.readFileSync('results/' + f, 'utf8')));
+            teams.sort((a, b) => (b.pass || 0) - (a.pass || 0));
+
+            let md = '# Leaderboard -- Rinha FullStack SENAI 2026\n\n';
+            md += 'Atualizado em: ' + new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC\n\n';
+            md += '| # | Time | Testes | Status |\n';
+            md += '|---|------|--------|--------|\n';
+            teams.forEach((t, i) => {
+              if (t.error) {
+                md += '| ' + (i+1) + ' | ' + t.team + ' | - | ' + t.error + ' |\n';
+              } else {
+                md += '| ' + (i+1) + ' | ' + t.team + ' | ' + t.pass + '/' + t.total + ' | OK |\n';
+              }
+            });
+            md += '\nResultado completo: [RESULTS.md](./RESULTS.md)\n';
+            fs.writeFileSync('LEADERBOARD.md', md);
+            console.log('LEADERBOARD.md gerado');
+          "
+
+      - name: Generate RESULTS.md
+        run: |
+          node -e "
+            const fs = require('fs');
+            const files = fs.readdirSync('results').filter(f => f.endsWith('.json'));
+            const teams = files.map(f => JSON.parse(fs.readFileSync('results/' + f, 'utf8')));
+            teams.sort((a, b) => (b.pass || 0) - (a.pass || 0));
+
+            let md = '# Resultados Completos -- Rinha FullStack SENAI 2026\n\n';
+            md += 'Atualizado em: ' + new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC\n';
+            md += 'Total de times: ' + teams.length + '\n\n';
+            md += '| # | Time | Testes | Status |\n';
+            md += '|---|------|--------|--------|\n';
+            teams.forEach((t, i) => {
+              if (t.error) {
+                md += '| ' + (i+1) + ' | ' + t.team + ' | - | ' + t.error + ' |\n';
+              } else {
+                md += '| ' + (i+1) + ' | ' + t.team + ' | ' + t.pass + '/' + t.total + ' | OK |\n';
+              }
+            });
+            md += '\n---\n\n';
+            teams.forEach(t => {
+              const info = t.info || {};
+              const members = (info.members || []).map(m => m.name + ' (' + m.github + ')').join(', ');
+              md += '<details>\n<summary>' + t.team + ' -- ' + (t.error ? 'ERRO' : t.pass + '/' + t.total) + '</summary>\n\n';
+              if (members) md += '- Membros: ' + members + '\n';
+              if (t.error) md += '- Erro: ' + t.error + '\n';
+              else md += '- Testes: ' + t.pass + '/' + t.total + ' passando\n';
+              md += '\n</details>\n\n';
+            });
+            fs.writeFileSync('RESULTS.md', md);
+            console.log('RESULTS.md gerado');
+          "
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add LEADERBOARD.md RESULTS.md
+          git diff --cached --quiet || git commit -m "chore: atualiza leaderboard e resultados"
+          git push
