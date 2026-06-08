@@ -288,89 +288,137 @@ async function testFrontend() {
 async function testStress() {
   console.log('\n=== FASE 3: Stress test (API) ===\n')
 
-  // Send in batches to avoid overwhelming SQLite
-  const BATCH_SIZE = 5
-  const TOTAL = 30
+  // ---- Phase 3a: Throughput blast ----
+  const TOTAL = 200
+  const CONCURRENCY = 20
   let created = 0
   let errors500 = 0
-  const start = Date.now()
+  let errors422 = 0
+  let errorsOther = 0
+  const latencies = []
   const ts = Date.now()
+  const start = Date.now()
 
-  for (let batch = 0; batch < TOTAL / BATCH_SIZE; batch++) {
-    const promises = []
-    for (let i = 0; i < BATCH_SIZE; i++) {
-      const idx = batch * BATCH_SIZE + i
+  // Fire TOTAL requests with CONCURRENCY workers
+  let nextIdx = 0
+  async function worker() {
+    while (true) {
+      const idx = nextIdx++
+      if (idx >= TOTAL) return
       const brands = ['4', '5', '3', '6']
       const brand = brands[idx % 4]
-      // Use unique last4 per batch to avoid daily limit
-      const suffix = String(idx + 1000).padStart(4, '0')
-      promises.push(
-        api('POST', '/api/transactions', {
-          card_number: `${brand}${String(idx).padStart(11, '0')}${suffix}`,
+      // Unique card per request to avoid daily limit collision
+      const suffix = String(idx).padStart(4, '0')
+      const cardNum = `${brand}${String(idx).padStart(11, '0')}${suffix}`
+      const reqStart = Date.now()
+      try {
+        const r = await api('POST', '/api/transactions', {
+          card_number: cardNum,
           holder_name: `Stress ${idx}`,
           expiration: '12/29',
           cvv: '123',
-          amount_cents: 5000,
+          amount_cents: 1000,
           installments: 1,
           description: `Stress ${idx}`,
           idempotency_key: `stress-${idx}-${ts}`
-        }).then(r => {
-          if (r.status === 201) created++
-          else if (r.status >= 500) errors500++
-        }).catch(() => { errors500++ })
-      )
+        })
+        latencies.push(Date.now() - reqStart)
+        if (r.status === 201) created++
+        else if (r.status >= 500) errors500++
+        else if (r.status === 422) errors422++
+        else errorsOther++
+      } catch {
+        latencies.push(Date.now() - reqStart)
+        errors500++
+      }
     }
-    await Promise.all(promises)
-    // Small delay between batches to let SQLite breathe
-    await new Promise(r => setTimeout(r, 100))
   }
+
+  const workers = []
+  for (let w = 0; w < CONCURRENCY; w++) workers.push(worker())
+  await Promise.all(workers)
 
   const elapsed = Date.now() - start
   const throughput = Math.round(created / (elapsed / 1000))
 
+  // Latency percentiles
+  latencies.sort((a, b) => a - b)
+  const p50 = latencies[Math.floor(latencies.length * 0.5)] || 0
+  const p95 = latencies[Math.floor(latencies.length * 0.95)] || 0
+  const p99 = latencies[Math.floor(latencies.length * 0.99)] || 0
+  const avgLatency = Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length)
+
   check('stress', `${created}/${TOTAL} transacoes criadas`, created >= TOTAL * 0.8,
-    `${created} de ${TOTAL}`)
+    `${created} ok, ${errors500} err500, ${errors422} err422, ${errorsOther} other`)
   check('stress', 'Zero erros 500', errors500 === 0, errors500 > 0 ? `${errors500} erros` : '')
-  check('stress', `Throughput: ${throughput} txn/s`, throughput > 0, `${elapsed}ms`)
+  check('stress', `Throughput >= 50 txn/s (${throughput} txn/s)`, throughput >= 50,
+    `${elapsed}ms total, ${CONCURRENCY} workers`)
+  check('stress', `P95 latencia < 500ms (${p95}ms)`, p95 < 500,
+    `p50=${p50}ms p95=${p95}ms p99=${p99}ms avg=${avgLatency}ms`)
+
   results.metrics = results.metrics || {}
   results.metrics.throughput = throughput
   results.metrics.stress_elapsed_ms = elapsed
   results.metrics.stress_created = created
   results.metrics.stress_total = TOTAL
+  results.metrics.latency_p50_ms = p50
+  results.metrics.latency_p95_ms = p95
+  results.metrics.latency_p99_ms = p99
+  results.metrics.latency_avg_ms = avgLatency
 
-  // Idempotency stress: send same key from multiple workers
+  // ---- Phase 3b: Idempotency stress (10 concurrent same key) ----
   const idemKey = `idem-stress-${Date.now()}`
   const idemPromises = []
-  for (let w = 0; w < 5; w++) {
+  for (let w = 0; w < 10; w++) {
     idemPromises.push(api('POST', '/api/transactions', {
       card_number: '4100000000000100', holder_name: 'Idem Stress', expiration: '12/28',
-      cvv: '123', amount_cents: 5000, installments: 1, description: 'Idem', idempotency_key: idemKey
+      cvv: '123', amount_cents: 1000, installments: 1, description: 'Idem', idempotency_key: idemKey
     }))
   }
   const idemResults = await Promise.all(idemPromises)
   const created201 = idemResults.filter(r => r.status === 201).length
   const existing200 = idemResults.filter(r => r.status === 200).length
-  const idemOk = (created201 + existing200 === 5) && created201 >= 1
-  check('stress', 'Idempotencia concorrente: 1 criada + N duplicatas', idemOk,
+  const idemOk = (created201 + existing200 === 10) && created201 >= 1
+  check('stress', 'Idempotencia concorrente (10 workers): 1 criada + N duplicatas', idemOk,
     `201=${created201} 200=${existing200}`)
 
-  // Double refund stress - criar transacao fresca
+  // ---- Phase 3c: Double refund stress (5 concurrent) ----
   const refundTx = await api('POST', '/api/transactions', {
     card_number: '4200000000000200', holder_name: 'Refund Stress', expiration: '12/28',
-    cvv: '123', amount_cents: 5000, installments: 1, description: 'Stress refund', idempotency_key: `stress-refund-${Date.now()}`
+    cvv: '123', amount_cents: 1000, installments: 1, description: 'Stress refund', idempotency_key: `stress-refund-${Date.now()}`
   })
   if (refundTx.status === 201 && refundTx.data?.id) {
-    const refundPromises = [
-      api('POST', `/api/transactions/${refundTx.data.id}/refund`),
-      api('POST', `/api/transactions/${refundTx.data.id}/refund`)
-    ]
+    const refundPromises = []
+    for (let i = 0; i < 5; i++) {
+      refundPromises.push(api('POST', `/api/transactions/${refundTx.data.id}/refund`))
+    }
     const refundResults = await Promise.all(refundPromises)
     const refunded = refundResults.filter(r => r.data?.status === 'refunded').length
-    check('stress', 'Double refund concorrente: apenas 1 estorno', refunded === 1,
+    check('stress', 'Double refund concorrente (5 workers): apenas 1 estorno', refunded === 1,
       `${refunded} estornos`)
   } else {
-    check('stress', 'Double refund concorrente: apenas 1 estorno', false, 'sem transacao')
+    check('stress', 'Double refund concorrente (5 workers): apenas 1 estorno', false, 'sem transacao')
   }
+
+  // ---- Phase 3d: Burst read under write load ----
+  const burstTs = Date.now()
+  const burstWrites = []
+  const burstReads = []
+  for (let i = 0; i < 50; i++) {
+    burstWrites.push(api('POST', '/api/transactions', {
+      card_number: `4${String(i + 5000).padStart(15, '0')}`,
+      holder_name: `Burst ${i}`, expiration: '12/29', cvv: '123',
+      amount_cents: 1000, installments: 1, description: `Burst ${i}`,
+      idempotency_key: `burst-${i}-${burstTs}`
+    }))
+    burstReads.push(api('GET', '/api/transactions?page=1&limit=5'))
+  }
+  const allBurst = await Promise.all([...burstWrites, ...burstReads])
+  const burstWriteOk = allBurst.slice(0, 50).filter(r => r.status === 201).length
+  const burstReadOk = allBurst.slice(50).filter(r => r.status === 200).length
+  check('stress', `Read/Write concorrente: ${burstWriteOk}/50 writes + ${burstReadOk}/50 reads`,
+    burstWriteOk >= 40 && burstReadOk >= 45,
+    `${burstWriteOk} writes ok, ${burstReadOk} reads ok`)
 }
 
 // ============================================================

@@ -104,20 +104,25 @@ jobs:
             const fs = require('fs');
             const files = fs.readdirSync('results').filter(f => f.endsWith('.json'));
             const teams = files.map(f => JSON.parse(fs.readFileSync('results/' + f, 'utf8')));
-            teams.sort((a, b) => (b.summary?.pass || 0) - (a.summary?.pass || 0));
+            teams.sort((a, b) => (b.scoring?.total || 0) - (a.scoring?.total || 0));
             const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
             // LEADERBOARD.md
             let lb = '# 🏆 Leaderboard -- Rinha FullStack SENAI 2026\n\n';
             lb += '> Atualizado em: ' + now + ' UTC\n\n';
-            lb += '| # | Time | Testes | Status |\n';
-            lb += '|---|------|--------|--------|\n';
+            lb += '| # | Time | Pontos | Testes | Throughput | P95 | Status |\n';
+            lb += '|---|------|--------|--------|------------|-----|--------|\n';
             teams.forEach((t, i) => {
               const s = t.summary || {};
+              const sc = t.scoring || {};
+              const m = t.metrics || {};
               const icon = t.error ? '❌' : s.fail === 0 ? '✅' : '⚠️';
-              const score = t.error ? '-' : s.pass + '/' + s.total;
+              const pts = t.error ? '-' : (sc.total || 0) + '/100';
+              const tests = t.error ? '-' : s.pass + '/' + s.total;
+              const tput = m.throughput ? m.throughput + ' txn/s' : '-';
+              const p95 = m.latency_p95_ms != null ? m.latency_p95_ms + 'ms' : '-';
               const status = t.error || (s.fail === 0 ? 'Perfeito' : s.fail + ' falha(s)');
-              lb += '| ' + (i+1) + ' | ' + (t.team||t.info?.team||'?') + ' | ' + score + ' | ' + icon + ' ' + status + ' |\n';
+              lb += '| ' + (i+1) + ' | ' + (t.team||t.info?.team||'?') + ' | **' + pts + '** | ' + tests + ' | ' + tput + ' | ' + p95 + ' | ' + icon + ' ' + status + ' |\n';
             });
             lb += '\n📋 [Resultado completo](./RESULTS.md)\n';
             fs.writeFileSync('LEADERBOARD.md', lb);
@@ -126,32 +131,70 @@ jobs:
             let md = '# 📊 Resultados Completos -- Rinha FullStack SENAI 2026\n\n';
             md += '> Atualizado em: ' + now + ' UTC  \n';
             md += '> Total de times: ' + teams.length + '\n\n';
-            md += '| # | Time | Testes | Status |\n';
-            md += '|---|------|--------|--------|\n';
+            md += '| # | Time | Pontos | Testes | Status |\n';
+            md += '|---|------|--------|--------|--------|\n';
             teams.forEach((t, i) => {
               const s = t.summary || {};
-              const score = t.error ? '-' : s.pass + '/' + s.total;
-              md += '| ' + (i+1) + ' | ' + (t.team||'?') + ' | ' + score + ' | ' + (t.error || 'OK') + ' |\n';
+              const sc = t.scoring || {};
+              const pts = t.error ? '-' : (sc.total || 0) + '/100';
+              const tests = t.error ? '-' : s.pass + '/' + s.total;
+              md += '| ' + (i+1) + ' | ' + (t.team||'?') + ' | **' + pts + '** | ' + tests + ' | ' + (t.error || 'OK') + ' |\n';
             });
             md += '\n---\n\n';
             teams.forEach(t => {
               const info = t.info || {};
               const members = (info.members || []).map(m => m.name + ' (' + m.github + ')').join(', ');
               const s = t.summary || {};
-              md += '<details>\n<summary><strong>' + (t.team||'?') + '</strong> -- ' + (t.error ? '❌ ERRO' : '✅ ' + s.pass + '/' + s.total) + '</summary>\n\n';
+              const sc = t.scoring || {};
+              const m = t.metrics || {};
+              md += '<details>\n<summary><strong>' + (t.team||'?') + '</strong> -- ' + (t.error ? '❌ ERRO' : '✅ ' + (sc.total||0) + '/100 pts — ' + s.pass + '/' + s.total + ' testes') + '</summary>\n\n';
               if (members) md += '**Membros:** ' + members + '\n\n';
               if (t.error) { md += '**Erro:** ' + t.error + '\n'; }
               else {
+                // Scoring table
+                md += '| Categoria | Testes | Pontos |\n';
+                md += '|-----------|--------|--------|\n';
+                md += '| Regras de negocio | ' + (sc.rules?.pass||0) + '/' + (sc.rules?.total||0) + ' | **' + (sc.rules?.score||0) + '/50** |\n';
+                md += '| Frontend | ' + (sc.frontend?.pass||0) + '/' + (sc.frontend?.total||0) + ' | **' + (sc.frontend?.score||0) + '/30** |\n';
+                md += '| Stress | ' + (sc.stress?.pass||0) + '/' + (sc.stress?.total||0) + ' | **' + (sc.stress?.score||0) + '/20** |\n';
+                md += '| **Total** | **' + s.pass + '/' + s.total + '** | **' + (sc.total||0) + '/100** |\n\n';
+                // Performance metrics
+                if (m.throughput) {
+                  md += '**Performance:**\n\n';
+                  md += '| Metrica | Valor |\n';
+                  md += '|---------|-------|\n';
+                  md += '| Throughput | **' + m.throughput + ' txn/s** |\n';
+                  md += '| Total | ' + (m.stress_created||0) + '/' + (m.stress_total||0) + ' txns em ' + (m.stress_elapsed_ms||0) + 'ms |\n';
+                  md += '| Latencia avg | ' + (m.latency_avg_ms||'-') + 'ms |\n';
+                  md += '| Latencia p50 | ' + (m.latency_p50_ms||'-') + 'ms |\n';
+                  md += '| Latencia p95 | ' + (m.latency_p95_ms||'-') + 'ms |\n';
+                  md += '| Latencia p99 | ' + (m.latency_p99_ms||'-') + 'ms |\n\n';
+                }
                 ['rules','frontend','stress'].forEach(cat => {
                   const items = t[cat] || [];
                   if (items.length === 0) return;
                   const title = {rules:'Regras de negocio',frontend:'Frontend (Playwright)',stress:'Stress test'}[cat];
+                  const failing = items.filter(x => !x.ok);
+                  const passing = items.filter(x => x.ok);
                   md += '**' + title + ':**\n';
-                  items.forEach(i => {
-                    md += '- ' + (i.ok ? '✅' : '❌') + ' ' + i.name;
-                    if (i.detail) md += ' *(' + i.detail + ')*';
-                    md += '\n';
-                  });
+                  if (failing.length > 0) {
+                    failing.forEach(x => {
+                      md += '- ❌ ' + x.name;
+                      if (x.detail) md += ' — `' + x.detail + '`';
+                      md += '\n';
+                    });
+                  }
+                  if (passing.length > 0 && failing.length > 0) {
+                    md += '<details><summary>✅ ' + passing.length + ' passando</summary>\n\n';
+                    passing.forEach(x => { md += '- ✅ ' + x.name + '\n'; });
+                    md += '</details>\n';
+                  } else {
+                    passing.forEach(x => {
+                      md += '- ✅ ' + x.name;
+                      if (x.detail) md += ' *(' + x.detail + ')*';
+                      md += '\n';
+                    });
+                  }
                   md += '\n';
                 });
               }

@@ -13,6 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -69,9 +76,10 @@ jobs:
         run: node bench/run.js
 
       - name: Post results
-        if: steps.team.outputs.skip != 'true' && always()
+        if: steps.team.outputs.skip != 'true' && steps.app-token.outputs.token && always()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const fs = require('fs');
             const team = '${{ steps.team.outputs.team }}';
@@ -84,7 +92,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: `## ❌ Benchmark falhou -- ${team}\n\nO bench nao conseguiu gerar resultados. Verifique os logs.`
+                body: `## ❌ Benchmark falhou: ${team}\n\nO bench nao conseguiu gerar resultados. Verifique os logs.`
               });
               return;
             }
@@ -129,7 +137,7 @@ jobs:
               return md;
             }
 
-            let body = `## ${status} Resultado — ${team}\n\n`;
+            let body = `## ${status} Resultado: ${team}\n\n`;
             body += `### Pontuacao: **${totalScore}/100**\n\n`;
             body += `| Categoria | Testes | Pontos |\n`;
             body += `|-----------|--------|--------|\n`;
@@ -143,7 +151,11 @@ jobs:
               body += `| Metrica | Valor |\n`;
               body += `|---------|-------|\n`;
               body += `| Throughput | **${metrics.throughput} txn/s** |\n`;
-              body += `| Stress latencia | **${metrics.stress_elapsed_ms}ms** (${metrics.stress_created}/${metrics.stress_total} txns) |\n`;
+              body += `| Total | **${metrics.stress_created}/${metrics.stress_total} txns** em ${metrics.stress_elapsed_ms}ms |\n`;
+              body += `| Latencia avg | **${metrics.latency_avg_ms || '-'}ms** |\n`;
+              body += `| Latencia p50 | **${metrics.latency_p50_ms || '-'}ms** |\n`;
+              body += `| Latencia p95 | **${metrics.latency_p95_ms || '-'}ms** |\n`;
+              body += `| Latencia p99 | **${metrics.latency_p99_ms || '-'}ms** |\n`;
             }
 
             body += renderCategory('Regras de negocio (API)', results.rules, scoring.rules);
