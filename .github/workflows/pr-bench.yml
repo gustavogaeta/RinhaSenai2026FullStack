@@ -167,16 +167,31 @@ jobs:
             FAIL=$((FAIL+1))
           fi
 
-          # Test: installments with interest (3x, 2% compound)
-          RESP=$(curl -s -X POST http://localhost:3000/api/transactions \
-            -H "Content-Type: application/json" \
-            -d '{"card_number":"4111111111111111","holder_name":"Install","expiration":"12/28","cvv":"123","amount_cents":50000,"installments":3,"description":"Parcelas","idempotency_key":"bench-005"}')
-          # 50000 * 1.02^3 = 53060.804 -> ceil = 53061
-          if echo "$RESP" | grep -q '"total_with_interest":53061'; then
-            RESULTS="$RESULTS\n- [x] Juros compostos 2%/mes calculados corretamente (3x)"
+          # Test: fee and net_amount calculation (visa 2.5%, 1x, 10000 centavos)
+          # fee = ceil(10000 * 0.025) = 250, net = 10000 - 250 = 9750
+          if echo "$BODY" | grep -q '"net_amount":9750'; then
+            RESULTS="$RESULTS\n- [x] net_amount = amount_cents - fee_cents (9750)"
             PASS=$((PASS+1))
           else
-            RESULTS="$RESULTS\n- [ ] Juros compostos 2%/mes calculados corretamente (3x)"
+            RESULTS="$RESULTS\n- [ ] net_amount = amount_cents - fee_cents"
+            FAIL=$((FAIL+1))
+          fi
+
+          # Test: installments with interest (3x, 2% compound)
+          # 15000 * 1.02^3 = 15918.12 -> ceil = 15919
+          # fee = ceil(15000 * 0.025) = 375, net = 15000 - 375 = 14625
+          RESP=$(curl -s -X POST http://localhost:3000/api/transactions \
+            -H "Content-Type: application/json" \
+            -d '{"card_number":"4111111111111111","holder_name":"Joao Silva","expiration":"12/28","cvv":"123","amount_cents":15000,"installments":3,"description":"Camiseta SENAI","idempotency_key":"bench-005"}')
+          BENCH_OK=true
+          echo "$RESP" | grep -q '"fee_cents":375' || BENCH_OK=false
+          echo "$RESP" | grep -q '"net_amount":14625' || BENCH_OK=false
+          echo "$RESP" | grep -q '"total_with_interest":15919' || BENCH_OK=false
+          if [ "$BENCH_OK" = true ]; then
+            RESULTS="$RESULTS\n- [x] Juros compostos + taxa corretos (3x visa, fee=375, net=14625)"
+            PASS=$((PASS+1))
+          else
+            RESULTS="$RESULTS\n- [ ] Juros compostos + taxa corretos (3x visa)"
             FAIL=$((FAIL+1))
           fi
 

@@ -39,9 +39,54 @@ export default async function (fastify) {
     // Validar campos obrigatorios
     if (
       !card_number || !holder_name || !expiration || !cvv ||
-      amount_cents == null || !installments || !description || !idempotency_key
+      amount_cents == null || !description || !idempotency_key
     ) {
       return reply.code(422).send({ error: 'Campos obrigatorios faltando' })
+    }
+
+    // Validar card_number: exatamente 16 digitos numericos
+    if (!/^\d{16}$/.test(card_number)) {
+      return reply.code(422).send({ error: 'card_number deve ter 16 digitos numericos' })
+    }
+
+    // Validar cvv: 3 ou 4 digitos numericos
+    if (!/^\d{3,4}$/.test(cvv)) {
+      return reply.code(422).send({ error: 'cvv deve ter 3 ou 4 digitos' })
+    }
+
+    // Validar amount_cents: > 0 e <= 1000000
+    if (!Number.isInteger(amount_cents) || amount_cents <= 0 || amount_cents > 1000000) {
+      return reply.code(422).send({ error: 'amount_cents deve ser entre 1 e 1000000' })
+    }
+
+    // Validar holder_name: nao vazio, max 50, sem tags HTML
+    if (typeof holder_name !== 'string' || holder_name.trim().length === 0 || holder_name.length > 50 || /<[^>]*>/.test(holder_name)) {
+      return reply.code(422).send({ error: 'holder_name invalido' })
+    }
+
+    // Validar expiration: MM/YY, nao vencido
+    if (!/^\d{2}\/\d{2}$/.test(expiration)) {
+      return reply.code(422).send({ error: 'expiration deve ser MM/YY' })
+    }
+    const [expMonth, expYear] = expiration.split('/').map(Number)
+    if (expMonth < 1 || expMonth > 12) {
+      return reply.code(422).send({ error: 'Mes de expiracao invalido' })
+    }
+    const now = new Date()
+    const expDate = new Date(2000 + expYear, expMonth)
+    if (expDate <= now) {
+      return reply.code(422).send({ error: 'Cartao vencido' })
+    }
+
+    // Validar installments: inteiro de 1 a 12
+    const parsedInstallments = installments != null ? installments : 1
+    if (!Number.isInteger(parsedInstallments) || parsedInstallments < 1 || parsedInstallments > 12) {
+      return reply.code(422).send({ error: 'installments deve ser de 1 a 12' })
+    }
+
+    // Validar description: max 100 caracteres
+    if (typeof description !== 'string' || description.trim().length === 0 || description.length > 100) {
+      return reply.code(422).send({ error: 'description invalida' })
     }
 
     // Checar idempotencia
@@ -67,17 +112,18 @@ export default async function (fastify) {
     const cardLast4 = card_number.slice(-4)
 
     // Calcular juros compostos
-    const totalWithInterest = calculateInterest(amount_cents, installments)
-    const installmentAmount = Math.ceil(totalWithInterest / installments)
+    const totalWithInterest = calculateInterest(amount_cents, parsedInstallments)
+    const installmentAmount = Math.ceil(totalWithInterest / parsedInstallments)
 
     // Verificar minimo por parcela
     if (installmentAmount < MIN_INSTALLMENT_CENTS) {
       return reply.code(422).send({ error: 'Valor minimo por parcela e R$10,00' })
     }
 
-    // Calcular taxa da bandeira
-    const feeCents = Math.ceil(totalWithInterest * brandFee)
-    const netAmount = totalWithInterest - feeCents
+    // Calcular taxa da bandeira sobre amount_cents (IDEIA.md: "A taxa e calculada sobre o amount_cents")
+    const feeCents = Math.ceil(amount_cents * brandFee)
+    // net_amount = amount_cents - fee_cents (IDEIA.md linha 829)
+    const netAmount = amount_cents - feeCents
 
     // Checar limite diario e salvar em transacao atomica
     const today = new Date()
@@ -116,7 +162,7 @@ export default async function (fastify) {
             cardBrand: brandName,
             holderName: holder_name,
             amountCents: amount_cents,
-            installments,
+            installments: parsedInstallments,
             installmentAmount,
             totalWithInterest: totalWithInterest,
             feeCents,
