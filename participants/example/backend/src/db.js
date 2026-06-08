@@ -12,4 +12,14 @@ try {
   console.warn('PRAGMA setup warning:', err.message)
 }
 
+// Mutex para serializar escritas no SQLite (evita SQLITE_BUSY)
+let writeLock = Promise.resolve()
+
+export function withWriteLock(fn) {
+  const prev = writeLock
+  let resolve
+  writeLock = new Promise(r => { resolve = r })
+  return prev.then(fn).finally(resolve)
+}
+
 export default prisma

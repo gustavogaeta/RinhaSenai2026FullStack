@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid'
-import prisma from '../db.js'
+import prisma, { withWriteLock } from '../db.js'
 
 const BRANDS = {
   '3': { name: 'amex', fee: 0.035 },
@@ -20,21 +20,6 @@ function calculateInterest(amountCents, installments) {
 
 const DAILY_LIMIT_CENTS = 500000
 const MIN_INSTALLMENT_CENTS = 1000
-const MAX_RETRIES = 8
-
-async function withRetry(fn) {
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      return await fn()
-    } catch (err) {
-      const msg = err.message || ''
-      const isRetryable = err.code === 'P2034' || msg.includes('SQLITE_BUSY') ||
-        msg.includes('database is locked') || msg.includes('Transaction API error')
-      if (!isRetryable || attempt === MAX_RETRIES - 1) throw err
-      await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt) + Math.random() * 100))
-    }
-  }
-}
 
 export default async function (fastify) {
 
@@ -147,7 +132,7 @@ export default async function (fastify) {
     tomorrow.setDate(tomorrow.getDate() + 1)
 
     try {
-      const tx = await withRetry(() =>
+      const tx = await withWriteLock(() =>
         prisma.$transaction(async (prismaClient) => {
           // Checar limite diario (so se for approved)
           if (!isDeclined) {
@@ -255,7 +240,7 @@ export default async function (fastify) {
     }
 
     // Atomically update only if still approved (prevents double refund)
-    const result = await withRetry(() =>
+    const result = await withWriteLock(() =>
       prisma.transaction.updateMany({
         where: { id, status: 'approved' },
         data: { status: 'refunded' },
